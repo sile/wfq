@@ -1,18 +1,15 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::Hash;
-use std::num::{NonZeroU64, NonZeroU8};
-
-const SCALED_ONE: u64 = 1 << 16;
+use std::num::NonZeroU64;
 
 #[derive(Debug)]
 pub struct WeightedFairQueue<K, T> {
     items: BinaryHeap<HeapItem<K, T>>,
     overflow: BinaryHeap<OverflowHeapItem<K, T>>,
-    flows: HashMap<K, FlowInfo>,
-    queue_size: usize,
-    max_queue_size: usize,
+    flows: HashMap<K, FlowState>,
+    queue_size: QueueSize,
+    max_normal_queue_size: usize,
     virtual_time: u64,
-    weight_sum: u64,
     seqno: u64,
 }
 
@@ -21,47 +18,45 @@ where
     K: Clone + Eq + Hash,
     T: AsRef<[u8]>,
 {
-    pub fn new(max_queue_size: usize) -> Self {
+    pub fn new(max_normal_queue_size: usize) -> Self {
         Self {
             items: BinaryHeap::new(),
             overflow: BinaryHeap::new(),
             flows: HashMap::new(),
-            queue_size: 0,
-            max_queue_size,
+            queue_size: QueueSize::new(),
+            max_normal_queue_size,
             virtual_time: 0,
-            weight_sum: 0,
             seqno: 0,
         }
     }
 
     pub fn enqueue(&mut self, item: Item<K, T>) {
         if !self.flows.contains_key(item.flow_key()) {
-            let fi = FlowInfo {
+            let flow = FlowState {
                 last_virtual_finish_time: self.virtual_time,
-                weight: item.flow_weight(),
-                size: 0,
+                queue_size: QueueSize::new(),
             };
-            self.weight_sum += u64::from(fi.weight.get());
-            self.flows.insert(item.flow_key().clone(), fi);
+            self.flows.insert(item.flow_key().clone(), flow);
         }
-        let fi = self.flows.get_mut(item.flow_key()).expect("unreachable");
+        let item_size = item.data_size();
 
-        let data_size = item.data().as_ref().len();
+        let flow = self.flows.get_mut(item.flow_key()).expect("unreachable");
+        flow.last_virtual_finish_time += item_size as u64 * item.weight.get();
+
         let item = HeapItem {
-            item,
+            inner: item,
             seqno: self.seqno,
-            virtual_finish_time: fi.last_virtual_finish_time + data_size as u64 * fi.inv_w(),
+            virtual_finish_time: flow.last_virtual_finish_time,
         };
         self.seqno += 1;
 
-        fi.last_virtual_finish_time = item.virtual_finish_time;
-        fi.size += item.data_size();
-
-        if self.queue_size + item.data_size() > self.max_queue_size {
-            let ohi = OverflowHeapItem(item);
-            self.overflow.push(ohi);
+        if self.queue_size.normal + item_size > self.max_normal_queue_size {
+            flow.queue_size.overflow += item_size;
+            self.queue_size.overflow += item_size;
+            self.overflow.push(OverflowHeapItem(item));
         } else {
-            self.queue_size += item.data_size();
+            flow.queue_size.normal += item_size;
+            self.queue_size.normal += item_size;
             self.items.push(item);
         }
     }
@@ -73,49 +68,61 @@ where
             return None;
         };
 
-        self.virtual_time += item.data_size() as u64 * self.inv_weight_sum();
-        self.queue_size -= item.data_size();
+        self.virtual_time = item.virtual_finish_time;
+        self.queue_size.normal -= item.inner.data_size();
 
-        let fi = self
+        let flow = self
             .flows
-            .get_mut(item.item.flow_key())
+            .get_mut(item.inner.flow_key())
             .expect("unreachable");
-        fi.size -= item.data_size();
-        if fi.size == 0 {
-            self.weight_sum -= u64::from(fi.weight.get());
-            self.flows.remove(item.item.flow_key());
+        flow.queue_size.normal -= item.inner.data_size();
+        if flow.queue_size.normal == 0 {
+            self.flows.remove(item.inner.flow_key());
         }
 
         while let Some(next) = self.overflow.pop() {
-            if self.queue_size + next.0.data_size() > self.max_queue_size {
+            if self.queue_size.normal + next.0.inner.data_size() > self.max_normal_queue_size {
                 self.overflow.push(next);
                 break;
             }
 
-            self.queue_size += next.0.data_size();
+            let flow = self
+                .flows
+                .get_mut(item.inner.flow_key())
+                .expect("unreachable");
+            flow.queue_size.normal += next.0.inner.data_size();
+            flow.queue_size.overflow -= next.0.inner.data_size();
+
+            self.queue_size.normal += next.0.inner.data_size();
+            self.queue_size.overflow -= next.0.inner.data_size();
+
             self.items.push(next.0);
         }
 
-        Some(item.item)
+        Some(item.inner)
     }
 
-    fn inv_weight_sum(&self) -> u64 {
-        SCALED_ONE / self.weight_sum
+    pub fn queue_size(&self) -> QueueSize {
+        self.queue_size.clone()
+    }
+
+    pub fn flows(&self) -> &HashMap<K, FlowState> {
+        &self.flows
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Item<K, T> {
     flow_key: K,
-    flow_weight: NonZeroU8,
+    weight: NonZeroU64,
     data: T,
 }
 
 impl<K, T> Item<K, T> {
-    pub fn new(flow_key: K, flow_weight: NonZeroU8, data: T) -> Self {
+    pub fn new(flow_key: K, weight: NonZeroU64, data: T) -> Self {
         Self {
             flow_key,
-            flow_weight,
+            weight,
             data,
         }
     }
@@ -124,8 +131,8 @@ impl<K, T> Item<K, T> {
         &self.flow_key
     }
 
-    pub fn flow_weight(&self) -> NonZeroU8 {
-        self.flow_weight
+    pub fn weight(&self) -> NonZeroU64 {
+        self.weight
     }
 
     pub fn data(&self) -> &T {
@@ -134,6 +141,15 @@ impl<K, T> Item<K, T> {
 
     pub fn into_data(self) -> T {
         self.data
+    }
+}
+
+impl<K, T> Item<K, T>
+where
+    T: AsRef<[u8]>,
+{
+    fn data_size(&self) -> usize {
+        self.data.as_ref().len()
     }
 }
 
@@ -166,19 +182,43 @@ impl IpPrecedence {
 }
 
 #[derive(Debug, Clone)]
-struct HeapItem<K, T> {
-    item: Item<K, T>,
-    seqno: u64,
-    virtual_finish_time: u64,
+pub struct FlowState {
+    pub queue_size: QueueSize,
+    pub last_virtual_finish_time: u64,
 }
 
-impl<K, T> HeapItem<K, T>
-where
-    T: AsRef<[u8]>,
-{
-    fn data_size(&self) -> usize {
-        self.item.data().as_ref().len()
+#[derive(Debug, Clone)]
+pub struct QueueSize {
+    normal: usize,
+    overflow: usize,
+}
+
+impl QueueSize {
+    fn new() -> Self {
+        Self {
+            normal: 0,
+            overflow: 0,
+        }
     }
+
+    pub fn total(&self) -> usize {
+        self.normal + self.overflow
+    }
+
+    pub fn normal(&self) -> usize {
+        self.normal
+    }
+
+    pub fn overflow(&self) -> usize {
+        self.overflow
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HeapItem<K, T> {
+    inner: Item<K, T>,
+    seqno: u64,
+    virtual_finish_time: u64,
 }
 
 impl<K, T> PartialEq for HeapItem<K, T> {
@@ -223,22 +263,9 @@ impl<K, T> PartialOrd for OverflowHeapItem<K, T> {
 impl<K, T> Ord for OverflowHeapItem<K, T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0
-            .item
-            .flow_weight()
-            .cmp(&other.0.item.flow_weight())
+            .inner
+            .weight()
+            .cmp(&other.0.inner.weight())
             .then_with(|| self.0.seqno.cmp(&other.0.seqno).reverse())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FlowInfo {
-    last_virtual_finish_time: u64,
-    size: usize,
-    weight: NonZeroU8,
-}
-
-impl FlowInfo {
-    fn inv_w(&self) -> u64 {
-        SCALED_ONE / u64::from(self.weight.get())
     }
 }
